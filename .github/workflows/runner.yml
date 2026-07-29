@@ -25,13 +25,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install telethon aiohttp aiofiles
-          # Install gh CLI (pre-installed on ubuntu-latest, but make sure)
-          gh --version || curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt update && sudo apt install gh -y
+          pip install telethon aiohttp
+          gh --version || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt update && sudo apt install gh -y)
 
-      - name: Restore Telethon session (if exists)
+      - name: Restore Telethon session
         env:
           TELETHON_SESSION_B64: ${{ secrets.TELETHON_SESSION_B64 }}
         run: |
@@ -39,18 +36,15 @@ jobs:
             echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
             echo "Session restored."
           else
-            echo "No session found — will login fresh."
+            echo "No session found!"
           fi
 
       - name: Run runner bot
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          SERVER_BOT_ID: ${{ secrets.SERVER_BOT_ID }}
-          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           echo "Dispatch payload: $DISPATCH_PAYLOAD"
