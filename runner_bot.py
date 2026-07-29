@@ -23,6 +23,7 @@ API_HASH = os.environ["API_HASH"]
 GH_PAT = os.environ.get("GH_PAT", "")
 REPO = os.environ.get("GITHUB_REPOSITORY", "linktofiletg/linktofile-bot")
 SERVER_BOT_USERNAME = "ytbdwnmasebot"
+INTERMEDIATE_CHANNEL = -1004363509644
 SESSION_FILE = "runner_session.session"
 
 DISPATCH_PAYLOAD = os.environ.get("DISPATCH_PAYLOAD", "{}")
@@ -65,26 +66,22 @@ def _upload_to_release(file_path):
 
 
 async def find_video():
-    """Fast scan — video is already in chat, UUID was sent right after it."""
-    logger.info(f"Scanning @{SERVER_BOT_USERNAME} for UUID={JOB_ID} (fast)...")
-    entity = await client.get_entity(SERVER_BOT_USERNAME)
+    """Scan channel for UUID text, then grab video message before it."""
+    logger.info(f"Scanning channel for UUID={JOB_ID}...")
 
-    # Try 3 times with 3s gaps (video is usually there immediately)
     for attempt in range(3):
-        msgs = await client.get_messages(entity, limit=20)
+        msgs = await client.get_messages(INTERMEDIATE_CHANNEL, limit=20)
         for i, m in enumerate(msgs):
             if m.text and JOB_ID in m.text:
                 logger.info(f"UUID at msg {m.id} (index {i})")
-                # Video is before or after the UUID message
-                for check_idx in [i + 1, i - 1]:
-                    if 0 <= check_idx < len(msgs):
-                        v = msgs[check_idx]
-                        if v.video or (v.document and v.document.mime_type and
-                                       v.document.mime_type.startswith("video/")):
-                            logger.info(f"Video msg {v.id}, size={v.file.size}")
-                            return v
+                # Video is the message right before UUID (forwarded first, then UUID text)
+                if i + 1 < len(msgs):
+                    v = msgs[i + 1]
+                    if v.video or (v.document and v.document.mime_type and
+                                   v.document.mime_type.startswith("video/")):
+                        logger.info(f"Video msg {v.id}, size={v.file.size}")
+                        return v
         if attempt < 2:
-            logger.info(f"Retry {attempt+1}...")
             await asyncio.sleep(3)
     return None
 
