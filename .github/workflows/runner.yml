@@ -1,0 +1,57 @@
+name: Runner Bot
+
+on:
+  repository_dispatch:
+    types: [process-file]
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Manual trigger test'
+        required: false
+        default: 'true'
+
+jobs:
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install telethon aiohttp aiofiles
+          # Install gh CLI (pre-installed on ubuntu-latest, but make sure)
+          gh --version || curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update && sudo apt install gh -y
+
+      - name: Restore Telethon session (if exists)
+        env:
+          TELETHON_SESSION_B64: ${{ secrets.TELETHON_SESSION_B64 }}
+        run: |
+          if [ -n "$TELETHON_SESSION_B64" ]; then
+            echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
+            echo "Session restored."
+          else
+            echo "No session found — will login fresh."
+          fi
+
+      - name: Run runner bot
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SERVER_BOT_ID: ${{ secrets.SERVER_BOT_ID }}
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          echo "Dispatch payload: $DISPATCH_PAYLOAD"
+          python runner_bot.py
