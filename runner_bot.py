@@ -141,7 +141,9 @@ async def _handle_video(event, chat_id):
         if download_url:
             result = f"✅ Uploaded!\n📁 {original_name}\n📦 {size/1e6:.1f} MB\n🔗 {download_url}"
             await wait.edit(result)
-            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}")
+            # Send to SERVER BOT (not user) — server bot forwards to user
+            # Format: RELEASE_RESULT::filename::size::url::chat_id
+            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}::{chat_id}")
             logger.info("Done! Shutting down in 10s...")
             await asyncio.sleep(10)
             await client.disconnect()
@@ -169,7 +171,7 @@ async def _handle_document(event, chat_id):
         if download_url:
             result = f"✅ Uploaded!\n📁 {original_name}\n📦 {size/1e6:.1f} MB\n🔗 {download_url}"
             await wait.edit(result)
-            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}")
+            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}::{chat_id}")
             await asyncio.sleep(10)
             await client.disconnect()
     except Exception as e:
@@ -219,7 +221,7 @@ async def _handle_url(event, chat_id):
         if download_url:
             result = f"✅ Uploaded!\n📁 {original_name}\n📦 {size/1e6:.1f} MB\n🔗 {download_url}"
             await wait.edit(result)
-            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}")
+            await _send_to_server_bot(f"RELEASE_RESULT::{original_name}::{size}::{download_url}::{chat_id}")
             await asyncio.sleep(10)
             await client.disconnect
     except Exception as e:
