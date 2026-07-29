@@ -142,19 +142,13 @@ async def main():
 
     if download_url:
         logger.info(f"Release URL: {download_url}")
-        # Send link back to user via the server bot
-        chat_id = int(USER_CHAT_ID)
-        result_text = (
-            f"✅ **Uploaded!**\n\n"
-            f"📁 `{FILENAME}`\n"
-            f"📦 {size/1e6:.1f} MB\n\n"
-            f"🔗 {download_url}"
-        )
+        # Send link to SERVER BOT (not user) — server bot replies to user
         try:
-            await client.send_message(chat_id, result_text, link_preview=False)
-            logger.info(f"Link sent to user {chat_id}")
+            bot_entity = await client.get_entity(SERVER_BOT_USERNAME)
+            await client.send_message(bot_entity, f"LINK_RESULT::{JOB_ID}::{download_url}::{FILENAME}::{size}::{USER_CHAT_ID}")
+            logger.info(f"Link sent to server bot for user {USER_CHAT_ID}")
         except Exception as e:
-            logger.error(f"Failed to send link to user: {e}")
+            logger.error(f"Failed to send to server bot: {e}")
     else:
         logger.error("Upload failed!")
 
