@@ -1,10 +1,10 @@
 """
 Runner-side bot: runs on GitHub Actions.
-- Receives UUID via dispatch payload
-- Scans intermediate channel for post with matching UUID
-- Downloads the video
+- Connects with inSell user session
+- Scans @ytbdwnmasebot chat for video with matching UUID
+- Downloads video
 - Uploads to GitHub Release
-- Sends download link back to inSell (owner)
+- Replies to the original user with the download link
 - Exits
 """
 import os
@@ -12,7 +12,6 @@ import sys
 import json
 import asyncio
 import logging
-import aiohttp
 import subprocess
 import datetime
 from telethon import TelegramClient
@@ -24,8 +23,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 GH_PAT = os.environ.get("GH_PAT", "")
 REPO = os.environ.get("GITHUB_REPOSITORY", "linktofiletg/linktofile-bot")
-OWNER_ID = 6576436474  # inSell
-INTERMEDIATE_CHANNEL = -1004363509644
+SERVER_BOT_USERNAME = "ytbdwnmasebot"
 SESSION_FILE = "runner_session.session"
 
 # Parse dispatch payload
@@ -53,7 +51,7 @@ def _upload_to_release(file_path, tag=None):
     subprocess.run(
         ["gh", "release", "create", tag, file_path,
          "--title", f"File {tag}",
-         "--notes", f"Auto-uploaded by runner bot (job: {JOB_ID})",
+         "--notes", f"Auto-uploaded by runner (job: {JOB_ID})",
          "--repo", REPO],
         check=True, env={**os.environ, "GH_TOKEN": GH_PAT}
     )
@@ -72,64 +70,94 @@ def _upload_to_release(file_path, tag=None):
     return None, tag
 
 
-async def find_video_in_channel():
-    """Scan channel for post with UUID in caption."""
-    logger.info(f"Scanning channel {INTERMEDIATE_CHANNEL} for UUID={JOB_ID}...")
-    
-    # Try up to 10 times, 10s apart (wait for user_client to forward)
-    for attempt in range(10):
-        msgs = await client.get_messages(INTERMEDIATE_CHANNEL, limit=20)
-        for m in msgs:
-            caption = (m.caption or "") + " " + (m.text or "")
-            if JOB_ID in caption and (m.video or (m.document and m.document.mime_type and m.document.mime_type.startswith("video/"))):
-                logger.info(f"Found video with UUID {JOB_ID} (msg {m.id})")
-                return m
-        logger.info(f"Attempt {attempt+1}: UUID not found yet, waiting 10s...")
+async def find_video_in_bot_chat():
+    """Scan @ytbdwnmasebot chat for video. The UUID was sent as a separate message
+    right after the forwarded video. We find the UUID message, then grab the
+    message before it (which should be the forwarded video)."""
+    logger.info(f"Scanning @{SERVER_BOT_USERNAME} chat for UUID={JOB_ID}...")
+
+    for attempt in range(15):
+        try:
+            entity = await client.get_entity(SERVER_BOT_USERNAME)
+            msgs = await client.get_messages(entity, limit=30)
+
+            # Find the UUID message
+            for i, m in enumerate(msgs):
+                if m.text and JOB_ID in m.text:
+                    logger.info(f"Found UUID message at index {i} (msg {m.id})")
+                    # The video should be the message right before this one
+                    # (forwarded video, then UUID text)
+                    if i + 1 < len(msgs):
+                        video_msg = msgs[i + 1]  # older message = next in list
+                        if video_msg.video or (video_msg.document and
+                            video_msg.document.mime_type and
+                            video_msg.document.mime_type.startswith("video/")):
+                            logger.info(f"Found video! msg {video_msg.id}, size={video_msg.file.size}")
+                            return video_msg
+                    # Also check message after (in case order is different)
+                    if i > 0:
+                        video_msg = msgs[i - 1]
+                        if video_msg.video or (video_msg.document and
+                            video_msg.document.mime_type and
+                            video_msg.document.mime_type.startswith("video/")):
+                            logger.info(f"Found video! msg {video_msg.id}, size={video_msg.file.size}")
+                            return video_msg
+
+            logger.info(f"Attempt {attempt+1}: UUID not found yet, waiting 10s...")
+        except Exception as e:
+            logger.warning(f"Scan error: {e}")
         await asyncio.sleep(10)
-    
+
     return None
 
 
 async def main():
     await client.connect()
-    
+
     if not await client.is_user_authorized():
         logger.error("Session not authorized!")
         return
-    
+
     me = await client.get_me()
     logger.info(f"Runner connected as: {me.first_name} (ID: {me.id})")
-    
-    # Find video in channel by UUID
-    video_msg = await find_video_in_channel()
+
+    # Find video in bot chat by UUID
+    video_msg = await find_video_in_bot_chat()
     if not video_msg:
-        logger.error(f"Video with UUID {JOB_ID} not found in channel!")
-        await client.send_message(OWNER_ID, f"❌ Video not found in channel!\n🆔 {JOB_ID}")
+        logger.error(f"Video with UUID {JOB_ID} not found!")
         await client.disconnect()
         return
-    
+
     # Download video
     tmp_path = f"/tmp/{FILENAME}"
     logger.info(f"Downloading {FILENAME}...")
     await client.download_media(video_msg, file=tmp_path)
     size = os.path.getsize(tmp_path)
     logger.info(f"Downloaded: {FILENAME} ({size/1e6:.1f} MB)")
-    
+
     # Upload to GitHub Release
     logger.info("Uploading to GitHub Release...")
     download_url, tag = _upload_to_release(tmp_path)
     os.remove(tmp_path)
-    
+
     if download_url:
         logger.info(f"Release URL: {download_url}")
-        # Send link to inSell with UUID
-        msg = f"RELEASE_RESULT::{FILENAME}::{size}::{download_url}::{USER_CHAT_ID}::{JOB_ID}"
-        await client.send_message(OWNER_ID, msg)
-        logger.info(f"Result sent to inSell: {msg}")
+        # Send link back to user via the server bot
+        chat_id = int(USER_CHAT_ID)
+        result_text = (
+            f"✅ **Uploaded!**\n\n"
+            f"📁 `{FILENAME}`\n"
+            f"📦 {size/1e6:.1f} MB\n\n"
+            f"🔗 {download_url}"
+        )
+        try:
+            await client.send_message(chat_id, result_text, link_preview=False)
+            logger.info(f"Link sent to user {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to send link to user: {e}")
     else:
         logger.error("Upload failed!")
-        await client.send_message(OWNER_ID, f"❌ Upload failed!\n🆔 {JOB_ID}")
-    
+
     await asyncio.sleep(5)
     await client.disconnect()
     logger.info("Runner done.")
