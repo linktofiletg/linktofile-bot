@@ -4,40 +4,27 @@ on:
   repository_dispatch:
     types: [process-file]
   workflow_dispatch:
-    inputs:
-      test:
-        description: 'Manual trigger test'
-        required: false
-        default: 'true'
 
 jobs:
   runner:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'  # cache pip dependencies — saves ~10s
 
       - name: Install dependencies
-        run: |
-          pip install telethon aiohttp
-          gh --version || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt update && sudo apt install gh -y)
+        run: pip install telethon aiohttp  # cached after first run
 
       - name: Restore Telethon session
         env:
           TELETHON_SESSION_B64: ${{ secrets.TELETHON_SESSION_B64 }}
         run: |
-          if [ -n "$TELETHON_SESSION_B64" ]; then
-            echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
-            echo "Session restored."
-          else
-            echo "No session found!"
-          fi
+          echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
 
       - name: Run runner bot
         env:
@@ -46,6 +33,4 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
-        run: |
-          echo "Dispatch payload: $DISPATCH_PAYLOAD"
-          python runner_bot.py
+        run: python runner_bot.py
