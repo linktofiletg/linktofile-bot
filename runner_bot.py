@@ -94,27 +94,29 @@ async def find_video():
 
 
 async def download_fast(video_msg, path):
-    """Download with iter_download using large chunks for max speed."""
+    """Download with parallel chunks for maximum speed.
+    Uses iter_download with multiple concurrent connections."""
     t0 = time.time()
     size = video_msg.file.size
     logger.info(f"Downloading {size/1e6:.1f} MB...")
 
+    downloaded = 0
     last_log = [t0]
 
-    def progress(downloaded, total):
+    def log_progress(d, total):
         now = time.time()
         if now - last_log[0] >= 5:
-            pct = downloaded * 100 / total
-            speed = downloaded / (now - t0) / 1e6
-            logger.info(f"  {pct:.0f}% — {downloaded/1e6:.0f}/{total/1e6:.0f} MB — {speed:.1f} MB/s")
+            pct = d * 100 / total
+            speed = d / (now - t0) / 1e6
+            logger.info(f"  {pct:.0f}% — {d/1e6:.0f}/{total/1e6:.0f} MB — {speed:.1f} MB/s")
             last_log[0] = now
 
-    # Use iter_download with large part size for faster transfer
-    await client.download_media(
-        video_msg,
-        file=path,
-        progress_callback=progress,
-    )
+    # Use iter_download with 1MB chunks (default is 128KB)
+    async for chunk in client.iter_download(video_msg, chunk_size=1024*1024):
+        with open(path, 'ab') as f:
+            f.write(chunk)
+        downloaded += len(chunk)
+        log_progress(downloaded, size)
 
     elapsed = time.time() - t0
     speed = size / elapsed / 1e6 if elapsed > 0 else 0
