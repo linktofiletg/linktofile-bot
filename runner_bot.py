@@ -94,29 +94,60 @@ async def find_video():
 
 
 async def download_fast(video_msg, path):
-    """Download with parallel chunks for maximum speed.
-    Uses iter_download with multiple concurrent connections."""
+    """Parallel download — multiple connections downloading different ranges."""
     t0 = time.time()
     size = video_msg.file.size
-    logger.info(f"Downloading {size/1e6:.1f} MB...")
+    logger.info(f"Downloading {size/1e6:.1f} MB with parallel connections...")
 
-    downloaded = 0
+    N_WORKERS = 8  # parallel connections
+    part_size = 1024 * 1024  # 1MB per chunk (Telegram max)
+    total_parts = (size + part_size - 1) // part_size
+    parts_per_worker = (total_parts + N_WORKERS - 1) // N_WORKERS
+
+    # Pre-create file with correct size
+    with open(path, 'wb') as f:
+        f.truncate(size)
+
+    downloaded = [0]
     last_log = [t0]
 
-    def log_progress(d, total):
+    def log_progress():
         now = time.time()
         if now - last_log[0] >= 5:
-            pct = d * 100 / total
-            speed = d / (now - t0) / 1e6
-            logger.info(f"  {pct:.0f}% — {d/1e6:.0f}/{total/1e6:.0f} MB — {speed:.1f} MB/s")
+            pct = downloaded[0] * 100 / size
+            speed = downloaded[0] / (now - t0) / 1e6
+            logger.info(f"  {pct:.0f}% — {downloaded[0]/1e6:.0f}/{size/1e6:.0f} MB — {speed:.1f} MB/s")
             last_log[0] = now
 
-    # Use iter_download with 1MB chunks (default is 128KB)
-    async for chunk in client.iter_download(video_msg, chunk_size=1024*1024):
-        with open(path, 'ab') as f:
-            f.write(chunk)
-        downloaded += len(chunk)
-        log_progress(downloaded, size)
+    async def download_range(worker_id, start_part, end_part):
+        """Download assigned parts to correct file offset."""
+        async for chunk in client.iter_download(
+            video_msg,
+            offset=start_part * part_size,
+            limit=(end_part - start_part) * part_size,
+            chunk_size=part_size,
+        ):
+            offset = start_part * part_size + downloaded_offset[worker_id]
+            with open(path, 'r+b') as f:
+                f.seek(offset)
+                f.write(chunk)
+            downloaded[0] += len(chunk)
+            downloaded_offset[worker_id] += len(chunk)
+            log_progress()
+
+    # Initialize per-worker offset tracking
+    downloaded_offset = {i: 0 for i in range(N_WORKERS)}
+
+    # Assign parts to workers
+    tasks = []
+    for w in range(N_WORKERS):
+        start = w * parts_per_worker
+        end = min((w + 1) * parts_per_worker, total_parts)
+        if start < end:
+            tasks.append(download_range(w, start, end))
+
+    # Run all workers in parallel
+    await asyncio.gather(*tasks)
 
     elapsed = time.time() - t0
     speed = size / elapsed / 1e6 if elapsed > 0 else 0
