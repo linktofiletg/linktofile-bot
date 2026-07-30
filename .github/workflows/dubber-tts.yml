@@ -31,3 +31,10 @@ jobs:
         env:
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python dubber_tts.py
+
+      - name: Upload transcript artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tts-transcript-${{ github.event.client_payload.job_id }}
+          path: output/
+
