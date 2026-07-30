@@ -154,10 +154,16 @@ for m in mapping:
     ], check=True, capture_output=True)
     
     # Check actual chunk duration
-    probe2 = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                            "-of", "default=noprint_wrappers=1:nokey=1", chunk_file],
+    probe2 = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+                            "-of", "csv=p=0", chunk_file],
                            capture_output=True, text=True)
-    actual_dur = float(probe2.stdout.strip())
+    dur_str = probe2.stdout.strip()
+    if dur_str and dur_str != "N/A":
+        actual_dur = float(dur_str)
+    else:
+        # ffprobe failed, use target duration as fallback
+        actual_dur = target_dur
+        logger.warning(f"  T{tid}: ffprobe returned N/A, using target {target_dur:.1f}s")
     
     chunk_files.append({
         "file": chunk_file,
