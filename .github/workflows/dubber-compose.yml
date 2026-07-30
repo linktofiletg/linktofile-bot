@@ -1,0 +1,26 @@
+name: Dubber Step 2 - Compose Dubbed Video
+
+on:
+  repository_dispatch:
+    types: [dubber-compose]
+  workflow_dispatch:
+
+jobs:
+  dubber-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run compositor
+        env:
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: python dubber_compose.py

@@ -1,0 +1,28 @@
+name: Dubber Step 1 - TTS to Timestamps
+
+on:
+  repository_dispatch:
+    types: [dubber-tts]
+  workflow_dispatch:
+
+jobs:
+  dubber-tts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install faster-whisper
+
+      - name: Run Whisper on TTS audio
+        env:
+          DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: python dubber_tts.py
