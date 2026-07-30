@@ -15,16 +15,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'  # cache pip dependencies — saves ~10s
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install telethon aiohttp  # cached after first run
+        run: pip install -r requirements.txt
 
       - name: Restore Telethon session
         env:
           TELETHON_SESSION_B64: ${{ secrets.TELETHON_SESSION_B64 }}
-        run: |
-          echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
+        run: echo "$TELETHON_SESSION_B64" | base64 -d > runner_session.session
 
       - name: Run runner bot
         env:
