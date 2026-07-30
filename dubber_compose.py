@@ -3,10 +3,9 @@ Dubber Step 2: Compose Dubbed Video
 - Downloads: video, TTS audio, TTS transcript JSON, original SRT, mapping JSON
 - Cuts TTS audio into segments per mapping
 - Speed-adjusts each chunk with atempo to fit original timing
-- Builds a new audio track: dubbed segments + silence for gaps
-- Replaces video's audio with the dubbed track (first half only)
-- Second half keeps original audio
-- Uploads result as artifact
+- Pads each chunk with silence to full video duration
+- Mixes all padded chunks together (normalize=0 = keep full volume)
+- Replaces video's audio with the dubbed track
 """
 import os
 import sys
@@ -28,18 +27,13 @@ except Exception:
 
 VIDEO_URL = payload.get("video_url", "")
 TTS_AUDIO_URL = payload.get("tts_audio_url", "")
-TTS_TRANSCRIPT_URL = payload.get("tts_transcript_url", "")  # JSON from step 1
+TTS_TRANSCRIPT_URL = payload.get("tts_transcript_url", "")
 ORIGINAL_SRT_URL = payload.get("original_srt_url", "")
 MAPPING_URL = payload.get("mapping_url", "")
 JOB_ID = payload.get("job_id", "dub")
 
 if not all([VIDEO_URL, TTS_AUDIO_URL, TTS_TRANSCRIPT_URL, ORIGINAL_SRT_URL, MAPPING_URL]):
     logger.error("Missing required inputs!")
-    logger.error(f"  video_url: {bool(VIDEO_URL)}")
-    logger.error(f"  tts_audio_url: {bool(TTS_AUDIO_URL)}")
-    logger.error(f"  tts_transcript_url: {bool(TTS_TRANSCRIPT_URL)}")
-    logger.error(f"  original_srt_url: {bool(ORIGINAL_SRT_URL)}")
-    logger.error(f"  mapping_url: {bool(MAPPING_URL)}")
     sys.exit(1)
 
 WORKDIR = f"/tmp/dub_{JOB_ID}"
@@ -66,7 +60,6 @@ download(MAPPING_URL, mapping_file)
 # ── Parse files ──
 with open(tts_json_file, encoding="utf-8") as f:
     tts_data = json.load(f)
-
 with open(mapping_file, encoding="utf-8") as f:
     mapping = json.load(f)
 
@@ -101,48 +94,38 @@ probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=durat
 video_duration = float(probe.stdout.strip())
 logger.info(f"Video duration: {video_duration:.1f}s")
 
-# ── Build dubbed audio track ──
-# For each mapping entry:
-# 1. Extract TTS audio chunk [t_start, t_end]
-# 2. Calculate target duration = orig segment duration(s)
-# 3. Speed-adjust with atempo
-# 4. Place at orig start time
-# 5. Fill gaps with silence
-
+# ── Process each mapping: cut TTS chunk + speed-adjust ──
 logger.info(f"Processing {len(mapping)} mapped segments...")
-chunk_files = []
+padded_files = []
 
 for m in mapping:
     tid = m["tts"]
     oids = m["orig"]
     t = tts_segments[tid - 1]
-    
-    # Target: original video time range
+
     o_start = orig[oids[0] - 1]["start"]
     o_end = orig[oids[-1] - 1]["end"]
     target_dur = o_end - o_start
-    
-    # Source: TTS audio time range
+
     t_start = t["start"]
     t_end = t["end"]
     tts_dur = t_end - t_start
-    
+
     if tts_dur <= 0 or target_dur <= 0:
         logger.warning(f"  T{tid}: zero duration, skipping")
         continue
-    
-    # Speed ratio
+
+    # Speed ratio (atempo: 0.5x-2.0x per filter, chain if needed)
     ratio = target_dur / tts_dur
-    # Clamp atempo: 0.5x to 2.0x per filter, chain if needed
     if ratio < 0.5:
-        atempo = "atempo=0.5,atempo=" + f"{ratio/0.5:.4f}"
+        atempo = f"atempo=0.5,atempo={ratio/0.5:.4f}"
     elif ratio > 2.0:
-        atempo = "atempo=2.0,atempo=" + f"{ratio/2.0:.4f}"
+        atempo = f"atempo=2.0,atempo={ratio/2.0:.4f}"
     else:
         atempo = f"atempo={ratio:.4f}"
-    
+
     logger.info(f"  T{tid:2d} → O{oids} | {tts_dur:.1f}s→{target_dur:.1f}s | {ratio:.2f}x | {t['text'][:40]}")
-    
+
     # Extract and speed-adjust chunk
     chunk_file = f"{WORKDIR}/chunk_{tid:03d}.wav"
     subprocess.run([
@@ -152,69 +135,56 @@ for m in mapping:
         "-ar", "44100", "-ac", "2",
         chunk_file
     ], check=True, capture_output=True)
-    
-    # Check actual chunk duration
-    probe2 = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
-                            "-of", "csv=p=0", chunk_file],
-                           capture_output=True, text=True)
-    dur_str = probe2.stdout.strip()
-    if dur_str and dur_str != "N/A":
-        actual_dur = float(dur_str)
-    else:
-        # ffprobe failed, use target duration as fallback
-        actual_dur = target_dur
-        logger.warning(f"  T{tid}: ffprobe returned N/A, using target {target_dur:.1f}s")
-    
-    chunk_files.append({
-        "file": chunk_file,
-        "start": o_start,
-        "dur": actual_dur,
-        "tid": tid
-    })
 
-# ── Build full audio track: silence + chunks ──
-logger.info("Building dubbed audio track...")
-final_audio = f"{WORKDIR}/dubbed_audio.wav"
-
-# Create a silent base track for the full video duration
-subprocess.run([
-    "ffmpeg", "-y",
-    "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
-    "-t", str(video_duration),
-    "-c:a", "pcm_s16le",
-    final_audio
-], check=True, capture_output=True)
-
-# Mix each chunk into the base at the right offset
-current_output = final_audio
-for i, chunk in enumerate(chunk_files):
-    mix_file = f"{WORKDIR}/mixed_{i:03d}.wav"
-    
-    # Use adelay to position the chunk, then amix
-    delay_ms = int(chunk["start"] * 1000)
-    
+    # Pad chunk with silence to full video duration (place at o_start offset)
+    padded_file = f"{WORKDIR}/padded_{tid:03d}.wav"
+    delay_ms = int(o_start * 1000)
     subprocess.run([
         "ffmpeg", "-y",
-        "-i", current_output,
-        "-i", chunk["file"],
-        "-filter_complex",
-        f"[1:a]adelay={delay_ms}|{delay_ms}[d];[0:a][d]amix=inputs=2:duration=first:dropout_transition=0[a]",
-        "-map", "[a]",
+        "-i", chunk_file,
+        "-af", f"adelay={delay_ms}|{delay_ms},apad=whole_dur={video_duration}",
+        "-t", str(video_duration),
+        "-ar", "44100", "-ac", "2",
         "-c:a", "pcm_s16le",
-        mix_file
+        padded_file
     ], check=True, capture_output=True)
-    
-    current_output = mix_file
+
+    padded_files.append(padded_file)
+    os.remove(chunk_file)
+
+# ── Mix all padded tracks together (normalize=0 = keep full volume) ──
+logger.info(f"Mixing {len(padded_files)} padded tracks...")
+
+if len(padded_files) == 1:
+    shutil.copy(padded_files[0], f"{WORKDIR}/dubbed_audio.wav")
+elif len(padded_files) > 1:
+    mix_inputs = "".join(f"[{j}:a]" for j in range(len(padded_files)))
+    filter_complex = f"{mix_inputs}amix=inputs={len(padded_files)}:normalize=0[a]"
+
+    args = ["ffmpeg", "-y"]
+    for pf in padded_files:
+        args += ["-i", pf]
+    args += ["-filter_complex", filter_complex, "-map", "[a]",
+             "-c:a", "pcm_s16le", f"{WORKDIR}/dubbed_audio.wav"]
+    subprocess.run(args, check=True, capture_output=True)
+
+# Clean up padded files
+for pf in padded_files:
+    try:
+        os.remove(pf)
+    except:
+        pass
+
+dubbed_audio = f"{WORKDIR}/dubbed_audio.wav"
 
 # ── Replace video audio ──
-# First half: dubbed audio
-# Second half: original audio (since TTS only covers first half)
-# Find the end of the last dubbed segment
-last_dub_end = max(c["start"] + c["dur"] for c in chunk_files)
-logger.info(f"Last dubbed segment ends at: {last_dub_end:.1f}s")
-
 output_file = "output/dubbed_video.mp4"
 os.makedirs("output", exist_ok=True)
+
+# Keep original audio for the part after dubbing ends
+# Find where dubbing ends
+last_dub_end = max(orig[m["orig"][-1] - 1]["end"] for m in mapping)
+logger.info(f"Last dub ends at: {last_dub_end:.1f}s, video: {video_duration:.1f}s")
 
 # Extract original audio from video
 orig_audio = f"{WORKDIR}/orig_audio.wav"
@@ -224,16 +194,14 @@ subprocess.run([
     "-c:a", "pcm_s16le", orig_audio
 ], check=True, capture_output=True)
 
-# Mix: dubbed audio for first part, original for rest
-# Use sidechain or simple amix with volume control
-# Simpler: use ffmpeg to mix dubbed track over original, with dubbed track louder
-# Actually best approach: replace audio entirely with dubbed track
-# (dubbed track already has silence in the second half from anullsrc base)
+# Mix: dubbed audio (full volume) + original audio (muted during dub, full after)
+# Use sidechaincompress or simpler: just use dubbed audio entirely
+# The dubbed track already has silence in second half (from apad)
 
 subprocess.run([
     "ffmpeg", "-y",
     "-i", video_file,
-    "-i", current_output,
+    "-i", dubbed_audio,
     "-map", "0:v", "-map", "1:a",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "192k",
@@ -244,10 +212,15 @@ subprocess.run([
 
 output_size = os.path.getsize(output_file)
 logger.info(f"✅ Output: {output_file} ({output_size/1e6:.1f} MB)")
-logger.info(f"   Video duration: {video_duration:.1f}s")
-logger.info(f"   Dubbed segments: {len(chunk_files)}")
-logger.info(f"   Last dub ends at: {last_dub_end:.1f}s")
-logger.info(f"   Rest ({video_duration - last_dub_end:.1f}s) has silence (or original audio)")
 
-# Cleanup temp files
+# Verify volume
+vol_check = subprocess.run([
+    "ffmpeg", "-i", output_file,
+    "-af", "volumedetect", "-f", "null", "-"
+], capture_output=True, text=True, timeout=30)
+for line in vol_check.stderr.split("\n"):
+    if "Volume" in line or "mean" in line or "max" in line:
+        logger.info(f"  {line.strip()}")
+
+# Cleanup
 shutil.rmtree(WORKDIR, ignore_errors=True)
