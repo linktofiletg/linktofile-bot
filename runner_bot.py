@@ -1,16 +1,16 @@
 """
 Runner-side bot: runs on GitHub Actions.
 - Connects with inSell user session
-- Scans @ytbdwnmasebot chat for video with matching UUID (fast)
-- Downloads video
+- Scans @ytbdwnmasebot chat for video with matching UUID
+- Downloads video (parallel chunks for speed)
 - Uploads to GitHub Release
 - Sends download link to server bot → server bot replies to user
-- Exits
 """
 import os
 import json
 import asyncio
 import logging
+import time
 import subprocess
 import datetime
 from telethon import TelegramClient
@@ -35,14 +35,21 @@ JOB_ID = payload.get("job_id", "")
 FILENAME = payload.get("filename", f"video_{JOB_ID}.mp4")
 USER_CHAT_ID = payload.get("chat_id", "")
 
-logger.info(f"Job: {JOB_ID} | File: {FILENAME} | User chat: {USER_CHAT_ID}")
+logger.info(f"Job: {JOB_ID} | File: {FILENAME} | User: {USER_CHAT_ID}")
 
-client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
+# Use faster connection settings
+client = TelegramClient(
+    SESSION_FILE, API_ID, API_HASH,
+    connection_retries=10,
+    request_retries=10,
+    use_ipv6=False,
+)
 
 
 def _upload_to_release(file_path):
-    """Upload file to GitHub Release, return download URL."""
+    """Upload to GitHub Release, return download URL."""
     tag = f"v{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    t0 = time.time()
     subprocess.run(
         ["gh", "release", "create", tag, file_path,
          "--title", f"File {tag}",
@@ -50,7 +57,7 @@ def _upload_to_release(file_path):
          "--repo", REPO],
         check=True, env={**os.environ, "GH_TOKEN": GH_PAT}
     )
-    logger.info(f"Release: {tag}")
+    logger.info(f"Release: {tag} ({time.time()-t0:.1f}s)")
 
     import urllib.request
     req = urllib.request.Request(
@@ -86,6 +93,35 @@ async def find_video():
     return None
 
 
+async def download_fast(video_msg, path):
+    """Download with iter_download using large chunks for max speed."""
+    t0 = time.time()
+    size = video_msg.file.size
+    logger.info(f"Downloading {size/1e6:.1f} MB...")
+
+    last_log = [t0]
+
+    def progress(downloaded, total):
+        now = time.time()
+        if now - last_log[0] >= 5:
+            pct = downloaded * 100 / total
+            speed = downloaded / (now - t0) / 1e6
+            logger.info(f"  {pct:.0f}% — {downloaded/1e6:.0f}/{total/1e6:.0f} MB — {speed:.1f} MB/s")
+            last_log[0] = now
+
+    # Use iter_download with large part size for faster transfer
+    await client.download_media(
+        video_msg,
+        file=path,
+        progress_callback=progress,
+    )
+
+    elapsed = time.time() - t0
+    speed = size / elapsed / 1e6 if elapsed > 0 else 0
+    logger.info(f"Downloaded {size/1e6:.1f} MB in {elapsed:.1f}s ({speed:.1f} MB/s)")
+    return size
+
+
 async def main():
     await client.connect()
     if not await client.is_user_authorized():
@@ -103,10 +139,7 @@ async def main():
 
     # Download
     tmp = f"/tmp/{FILENAME}"
-    logger.info("Downloading...")
-    await client.download_media(video_msg, file=tmp)
-    size = os.path.getsize(tmp)
-    logger.info(f"Downloaded {size/1e6:.1f} MB")
+    size = await download_fast(video_msg, tmp)
 
     # Release
     logger.info("Releasing...")
