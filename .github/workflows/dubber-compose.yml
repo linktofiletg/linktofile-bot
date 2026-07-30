@@ -8,7 +8,7 @@ on:
 jobs:
   dubber-compose:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -17,10 +17,21 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt
 
       - name: Run compositor
         env:
           DISPATCH_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python dubber_compose.py
+
+      - name: Upload dubbed video
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-video-${{ github.event.client_payload.job_id }}
+          path: output/

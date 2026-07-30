@@ -1,21 +1,25 @@
 """
 Dubber Step 2: Compose Dubbed Video
-- Takes: video URL, original subtitle SRT, TTS transcript JSON
-- Aligns TTS audio segments to original subtitle timestamps
-- Adjusts playback speed of TTS chunks to fit original timing
-- Produces a video with dubbed audio
+- Downloads: video, TTS audio, TTS transcript JSON, original SRT, mapping JSON
+- Cuts TTS audio into segments per mapping
+- Speed-adjusts each chunk with atempo to fit original timing
+- Builds a new audio track: dubbed segments + silence for gaps
+- Replaces video's audio with the dubbed track (first half only)
+- Second half keeps original audio
+- Uploads result as artifact
 """
 import os
 import sys
 import json
 import logging
 import subprocess
-import asyncio
 import urllib.request
+import shutil
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Parse payload ──
 DISPATCH_PAYLOAD = os.environ.get("DISPATCH_PAYLOAD", "{}")
 try:
     payload = json.loads(DISPATCH_PAYLOAD)
@@ -23,115 +27,221 @@ except Exception:
     payload = {}
 
 VIDEO_URL = payload.get("video_url", "")
-TTS_SRT_URL = payload.get("tts_srt_url", "")  # Whisper SRT from step 1
+TTS_AUDIO_URL = payload.get("tts_audio_url", "")
+TTS_TRANSCRIPT_URL = payload.get("tts_transcript_url", "")  # JSON from step 1
 ORIGINAL_SRT_URL = payload.get("original_srt_url", "")
-JOB_ID = payload.get("job_id", "")
+MAPPING_URL = payload.get("mapping_url", "")
+JOB_ID = payload.get("job_id", "dub")
 
-if not all([VIDEO_URL, TTS_SRT_URL, ORIGINAL_SRT_URL]):
+if not all([VIDEO_URL, TTS_AUDIO_URL, TTS_TRANSCRIPT_URL, ORIGINAL_SRT_URL, MAPPING_URL]):
     logger.error("Missing required inputs!")
+    logger.error(f"  video_url: {bool(VIDEO_URL)}")
+    logger.error(f"  tts_audio_url: {bool(TTS_AUDIO_URL)}")
+    logger.error(f"  tts_transcript_url: {bool(TTS_TRANSCRIPT_URL)}")
+    logger.error(f"  original_srt_url: {bool(ORIGINAL_SRT_URL)}")
+    logger.error(f"  mapping_url: {bool(MAPPING_URL)}")
     sys.exit(1)
 
-# Download video
-video_file = f"/tmp/video_{JOB_ID}.mp4"
-logger.info(f"Downloading video...")
-urllib.request.urlretrieve(VIDEO_URL, video_file)
-logger.info(f"Video downloaded")
+WORKDIR = f"/tmp/dub_{JOB_ID}"
+os.makedirs(WORKDIR, exist_ok=True)
 
-# Download original SRT (Persian subtitles with original timing)
-orig_srt = f"/tmp/orig_{JOB_ID}.srt"
-urllib.request.urlretrieve(ORIGINAL_SRT_URL, orig_srt)
+# ── Download files ──
+def download(url, path):
+    logger.info(f"Downloading {url}...")
+    urllib.request.urlretrieve(url, path)
+    logger.info(f"  → {os.path.getsize(path)/1e6:.1f} MB")
 
-# Download TTS SRT (Whisper timestamps of the TTS audio)
-tts_srt = f"/tmp/tts_{JOB_ID}.srt"
-urllib.request.urlretrieve(TTS_SRT_URL, tts_srt)
+video_file = f"{WORKDIR}/video.mp4"
+tts_audio_file = f"{WORKDIR}/tts_audio.wav"
+tts_json_file = f"{WORKDIR}/tts_transcript.json"
+orig_srt_file = f"{WORKDIR}/orig.srt"
+mapping_file = f"{WORKDIR}/mapping.json"
 
-# Parse both SRTs
+download(VIDEO_URL, video_file)
+download(TTS_AUDIO_URL, tts_audio_file)
+download(TTS_TRANSCRIPT_URL, tts_json_file)
+download(ORIGINAL_SRT_URL, orig_srt_file)
+download(MAPPING_URL, mapping_file)
+
+# ── Parse files ──
+with open(tts_json_file, encoding="utf-8") as f:
+    tts_data = json.load(f)
+
+with open(mapping_file, encoding="utf-8") as f:
+    mapping = json.load(f)
+
 def parse_srt(path):
     entries = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.read().strip().split("\n")
     i = 0
     while i < len(lines):
         if lines[i].strip().isdigit():
-            idx = int(lines[i])
-            i += 1
-            time_line = lines[i].strip()
-            i += 1
-            # Collect text lines until blank
+            idx = int(lines[i]); i += 1
+            time_line = lines[i].strip(); i += 1
             text = ""
             while i < len(lines) and lines[i].strip():
-                text += lines[i].strip() + " "
-                i += 1
-            i += 1  # skip blank
+                text += lines[i].strip() + " "; i += 1
+            i += 1
             parts = time_line.split(" --> ")
-            if len(parts) == 2:
-                def srt_time(t):
-                    t = t.replace(",", ".")
-                    h, m, s = t.split(":")
-                    return int(h)*3600 + int(m)*60 + float(s)
-                entries.append({
-                    "id": idx,
-                    "start": srt_time(parts[0]),
-                    "end": srt_time(parts[1]),
-                    "duration": srt_time(parts[1]) - srt_time(parts[0]),
-                    "text": text.strip()
-                })
+            def srt_time(t):
+                t = t.replace(",", "."); h, m, s = t.split(":")
+                return int(h)*3600 + int(m)*60 + float(s)
+            entries.append({"id": idx, "start": srt_time(parts[0]),
+                           "end": srt_time(parts[1]), "text": text.strip()})
     return entries
 
-orig = parse_srt(orig_srt)
-tts = parse_srt(tts_srt)
-logger.info(f"Original subtitles: {len(orig)} entries")
-logger.info(f"TTS transcript: {len(tts)} entries")
+orig = parse_srt(orig_srt_file)
+tts_segments = tts_data["segments"]
 
-# Prepare audio chunks
-os.makedirs(f"/tmp/dubber_{JOB_ID}", exist_ok=True)
+# ── Get video duration ──
+probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                       "-of", "default=noprint_wrappers=1:nokey=1", video_file],
+                      capture_output=True, text=True)
+video_duration = float(probe.stdout.strip())
+logger.info(f"Video duration: {video_duration:.1f}s")
 
-# List of (original_segment_audio, start_offset, duration)
-chunks = []
+# ── Build dubbed audio track ──
+# For each mapping entry:
+# 1. Extract TTS audio chunk [t_start, t_end]
+# 2. Calculate target duration = orig segment duration(s)
+# 3. Speed-adjust with atempo
+# 4. Place at orig start time
+# 5. Fill gaps with silence
 
-# For each original segment, find the matching TTS segment
-# We match 1:1 in order (assumes same number and order of segments)
-min_len = min(len(orig), len(tts))
-logger.info(f"Matching {min_len} segments...")
+logger.info(f"Processing {len(mapping)} mapped segments...")
+chunk_files = []
 
-for i in range(min_len):
-    o = orig[i]
-    t = tts[i]
+for m in mapping:
+    tid = m["tts"]
+    oids = m["orig"]
+    t = tts_segments[tid - 1]
     
-    # Extract TTS audio chunk for this segment
-    chunk_file = f"/tmp/dubber_{JOB_ID}/chunk_{i:04d}.wav"
+    # Target: original video time range
+    o_start = orig[oids[0] - 1]["start"]
+    o_end = orig[oids[-1] - 1]["end"]
+    target_dur = o_end - o_start
     
-    # Get video's audio stream as reference for timing
-    # We need TTS audio file — but we only have the SRT. 
-    # The actual TTS audio will be provided separately or extracted from the full TTS audio.
-    pass
+    # Source: TTS audio time range
+    t_start = t["start"]
+    t_end = t["end"]
+    tts_dur = t_end - t_start
+    
+    if tts_dur <= 0 or target_dur <= 0:
+        logger.warning(f"  T{tid}: zero duration, skipping")
+        continue
+    
+    # Speed ratio
+    ratio = target_dur / tts_dur
+    # Clamp atempo: 0.5x to 2.0x per filter, chain if needed
+    if ratio < 0.5:
+        atempo = "atempo=0.5,atempo=" + f"{ratio/0.5:.4f}"
+    elif ratio > 2.0:
+        atempo = "atempo=2.0,atempo=" + f"{ratio/2.0:.4f}"
+    else:
+        atempo = f"atempo={ratio:.4f}"
+    
+    logger.info(f"  T{tid:2d} → O{oids} | {tts_dur:.1f}s→{target_dur:.1f}s | {ratio:.2f}x | {t['text'][:40]}")
+    
+    # Extract and speed-adjust chunk
+    chunk_file = f"{WORKDIR}/chunk_{tid:03d}.wav"
+    subprocess.run([
+        "ffmpeg", "-y", "-i", tts_audio_file,
+        "-ss", str(t_start), "-to", str(t_end),
+        "-af", atempo,
+        "-ar", "44100", "-ac", "2",
+        chunk_file
+    ], check=True, capture_output=True)
+    
+    # Check actual chunk duration
+    probe2 = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1", chunk_file],
+                           capture_output=True, text=True)
+    actual_dur = float(probe2.stdout.strip())
+    
+    chunk_files.append({
+        "file": chunk_file,
+        "start": o_start,
+        "dur": actual_dur,
+        "tid": tid
+    })
 
-# ALTERNATIVE APPROACH: use the FULL TTS audio and cut by Whisper timestamps
-# Then stretch/squeeze each chunk to match original timing
+# ── Build full audio track: silence + chunks ──
+logger.info("Building dubbed audio track...")
+final_audio = f"{WORKDIR}/dubbed_audio.wav"
 
-logger.info("Full TTS audio not available separately — need audio_url in payload")
+# Create a silent base track for the full video duration
+subprocess.run([
+    "ffmpeg", "-y",
+    "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+    "-t", str(video_duration),
+    "-c:a", "pcm_s16le",
+    final_audio
+], check=True, capture_output=True)
 
-# Let's use the atempo filter in ffmpeg
-# For each segment:
-# 1. Extract TTS audio segment [t_start, t_end] from full TTS audio
-# 2. Speed up/slow down with atempo to match original [o_start, o_end]
-# 3. Concatenate all segments with silence in gaps
+# Mix each chunk into the base at the right offset
+current_output = final_audio
+for i, chunk in enumerate(chunk_files):
+    mix_file = f"{WORKDIR}/mixed_{i:03d}.wav"
+    
+    # Use adelay to position the chunk, then amix
+    delay_ms = int(chunk["start"] * 1000)
+    
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", current_output,
+        "-i", chunk["file"],
+        "-filter_complex",
+        f"[1:a]adelay={delay_ms}|{delay_ms}[d];[0:a][d]amix=inputs=2:duration=first:dropout_transition=0[a]",
+        "-map", "[a]",
+        "-c:a", "pcm_s16le",
+        mix_file
+    ], check=True, capture_output=True)
+    
+    current_output = mix_file
 
-# Signal back to server: we need the full TTS audio file URL
-# For now, print the matching plan
+# ── Replace video audio ──
+# First half: dubbed audio
+# Second half: original audio (since TTS only covers first half)
+# Find the end of the last dubbed segment
+last_dub_end = max(c["start"] + c["dur"] for c in chunk_files)
+logger.info(f"Last dubbed segment ends at: {last_dub_end:.1f}s")
 
-logger.info("=== DUBBING PLAN ===")
-for i in range(min(min_len, 5)):
-    o = orig[i]
-    t = tts[i]
-    ratio = o["duration"] / t["duration"] if t["duration"] > 0 else 1
-    logger.info(f"Segment {i+1}: orig={o['start']:.1f}-{o['end']:.1f}s ({o['duration']:.1f}s) "
-                f"tts={t['start']:.1f}-{t['end']:.1f}s ({t['duration']:.1f}s) "
-                f"speed_adjust={ratio:.2f}x")
+output_file = "output/dubbed_video.mp4"
+os.makedirs("output", exist_ok=True)
 
-if min_len > 5:
-    logger.info(f"... and {min_len - 5} more segments")
+# Extract original audio from video
+orig_audio = f"{WORKDIR}/orig_audio.wav"
+subprocess.run([
+    "ffmpeg", "-y", "-i", video_file,
+    "-vn", "-ac", "2", "-ar", "44100",
+    "-c:a", "pcm_s16le", orig_audio
+], check=True, capture_output=True)
 
-logger.info(f"Total orig duration: {sum(o['duration'] for o in orig):.1f}s")
-logger.info(f"Total tts duration: {sum(t['duration'] for t in tts[:min_len]):.1f}s")
-logger.info("Dubbing plan computed successfully")
+# Mix: dubbed audio for first part, original for rest
+# Use sidechain or simple amix with volume control
+# Simpler: use ffmpeg to mix dubbed track over original, with dubbed track louder
+# Actually best approach: replace audio entirely with dubbed track
+# (dubbed track already has silence in the second half from anullsrc base)
+
+subprocess.run([
+    "ffmpeg", "-y",
+    "-i", video_file,
+    "-i", current_output,
+    "-map", "0:v", "-map", "1:a",
+    "-c:v", "copy",
+    "-c:a", "aac", "-b:a", "192k",
+    "-shortest",
+    "-movflags", "+faststart",
+    output_file
+], check=True, capture_output=True)
+
+output_size = os.path.getsize(output_file)
+logger.info(f"✅ Output: {output_file} ({output_size/1e6:.1f} MB)")
+logger.info(f"   Video duration: {video_duration:.1f}s")
+logger.info(f"   Dubbed segments: {len(chunk_files)}")
+logger.info(f"   Last dub ends at: {last_dub_end:.1f}s")
+logger.info(f"   Rest ({video_duration - last_dub_end:.1f}s) has silence (or original audio)")
+
+# Cleanup temp files
+shutil.rmtree(WORKDIR, ignore_errors=True)
