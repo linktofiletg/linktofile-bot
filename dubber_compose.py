@@ -188,7 +188,7 @@ os.makedirs("output", exist_ok=True)
 
 # Keep original audio for the part after dubbing ends
 # Find where dubbing ends
-last_dub_end = max(orig[m["orig"][-1] - 1]["end"] for m in mapping)
+last_dub_end = max(orig[(m.get("orig_ids", m.get("orig", [1])))[-1] - 1]["end"] for m in mapping)
 logger.info(f"Last dub ends at: {last_dub_end:.1f}s, video: {video_duration:.1f}s")
 
 # Extract original audio from video
