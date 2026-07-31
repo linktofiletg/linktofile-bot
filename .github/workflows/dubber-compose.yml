@@ -17,10 +17,12 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Verify ffmpeg
+      - name: Install ffmpeg (static build)
         run: |
+          wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar xf ffmpeg-release-amd64-static.tar.xz
+          sudo mv ffmpeg-*-static/ffmpeg ffmpeg-*-static/ffprobe /usr/local/bin/
           ffmpeg -version | head -1
-          ffprobe -version | head -1
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
