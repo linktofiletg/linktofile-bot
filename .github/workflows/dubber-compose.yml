@@ -8,7 +8,7 @@ on:
 jobs:
   dubber-compose:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -17,11 +17,9 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install ffmpeg (static build)
+      - name: Install ffmpeg
         run: |
-          wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-          tar xf ffmpeg-release-amd64-static.tar.xz
-          sudo mv ffmpeg-*-static/ffmpeg ffmpeg-*-static/ffprobe /usr/local/bin/
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           ffmpeg -version | head -1
 
       - name: Install Python dependencies
