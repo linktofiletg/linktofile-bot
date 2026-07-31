@@ -100,11 +100,16 @@ padded_files = []
 
 for m in mapping:
     tid = m["tts"]
-    oids = m["orig"]
+    oids = m.get("orig_ids", m.get("orig", [tid]))
     t = tts_segments[tid - 1]
 
-    o_start = orig[oids[0] - 1]["start"]
-    o_end = orig[oids[-1] - 1]["end"]
+    # NEW FORMAT: target_start/target_end directly in mapping
+    if "target_start" in m and "target_end" in m:
+        o_start = m["target_start"]
+        o_end = m["target_end"]
+    else:
+        o_start = orig[oids[0] - 1]["start"]
+        o_end = orig[oids[-1] - 1]["end"]
     target_dur = o_end - o_start
 
     t_start = t["start"]
